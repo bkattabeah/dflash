@@ -1,6 +1,8 @@
+import json
+import torch
+from pathlib import Path
 from typing import Optional, Callable
 from typing_extensions import Unpack, Tuple
-import torch
 from torch import nn
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
@@ -17,7 +19,115 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from transformers import DynamicCache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
-from .utils import build_target_layer_ids, extract_context_feature, sample
+
+
+# ---------------------------------------------------------------------------
+# Dataset loading (auto-downloads from HuggingFace on first use)
+# ---------------------------------------------------------------------------
+
+CACHE_DIR = Path(__file__).parent / "cache"
+
+DATASETS = {
+    "gsm8k": {
+        "load_args": ("openai/gsm8k", "main"),
+        "load_kwargs": {"split": "test"},
+        "format": lambda x: "{question}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
+    },
+    "math500": {
+        "load_args": ("HuggingFaceH4/MATH-500",),
+        "load_kwargs": {"split": "test"},
+        "format": lambda x: "{problem}\nPlease reason step by step, and put your final answer within \\boxed{{}}.".format(**x),
+    },
+    "humaneval": {
+        "load_args": ("openai/openai_humaneval",),
+        "load_kwargs": {"split": "test"},
+        "format": lambda x: "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{prompt}\n```".format(**x),
+    },
+    "mbpp": {
+        "load_args": ("google-research-datasets/mbpp", "sanitized"),
+        "load_kwargs": {"split": "test"},
+        "format": lambda x: x["prompt"],
+    },
+    "mt-bench": {
+        "load_args": ("HuggingFaceH4/mt_bench_prompts",),
+        "load_kwargs": {"split": "train"},
+        "format": lambda x: x["prompt"],  # list of turns
+        "multi_turn": True,
+    },
+}
+
+
+def _prepare_dataset(name: str) -> Path:
+    from datasets import load_dataset
+
+    cfg = DATASETS[name]
+    CACHE_DIR.mkdir(exist_ok=True)
+    out_path = CACHE_DIR / f"{name}.jsonl"
+
+    print(f"[download] {name} ...")
+    dataset = load_dataset(*cfg["load_args"], **cfg["load_kwargs"])
+
+    with open(out_path, "w") as f:
+        for row in dataset:
+            if cfg.get("multi_turn"):
+                turns = cfg["format"](row)
+            else:
+                turns = [cfg["format"](row)]
+            f.write(json.dumps({"turns": turns}) + "\n")
+
+    print(f"[cached] {out_path}  ({sum(1 for _ in open(out_path))} samples)")
+    return out_path
+
+
+def load_and_process_dataset(data_name: str) -> list[dict]:
+    if data_name not in DATASETS:
+        raise ValueError(f"Unknown dataset '{data_name}'. Available: {list(DATASETS.keys())}")
+
+    path = CACHE_DIR / f"{data_name}.jsonl"
+    if not path.exists():
+        _prepare_dataset(data_name)
+
+    with open(path) as f:
+        return [json.loads(line) for line in f]
+
+
+# ---------------------------------------------------------------------------
+# Model utilities
+# ---------------------------------------------------------------------------
+
+def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
+    if num_draft_layers == 1:
+        return [(num_target_layers // 2)]
+    start = 1
+    end = num_target_layers - 3
+    span = end - start
+    return [
+        int(round(start + (i * span) / (num_draft_layers - 1)))
+        for i in range(num_draft_layers)
+    ]
+
+
+def extract_context_feature(
+    hidden_states: list[torch.Tensor],
+    layer_ids: Optional[list[int]],
+) -> torch.Tensor:
+    offset = 1
+    selected_states = [hidden_states[layer_id + offset] for layer_id in layer_ids]
+    return torch.cat(selected_states, dim=-1)
+
+
+def sample(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+    if temperature < 1e-5:
+        return torch.argmax(logits, dim=-1)
+    bsz, seq_len, vocab_size = logits.shape
+    logits = logits.view(-1, vocab_size) / temperature
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1).view(bsz, seq_len)
+
+
+# ---------------------------------------------------------------------------
+# DFlash model
+# ---------------------------------------------------------------------------
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
@@ -27,9 +137,8 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
-class Qwen3DFlashAttention(nn.Module):
-    """Multi-headed attention from 'Attention Is All You Need' paper"""
 
+class Qwen3DFlashAttention(nn.Module):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.config = config
@@ -38,7 +147,7 @@ class Qwen3DFlashAttention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.is_causal = False  
+        self.is_causal = False
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
         )
@@ -101,6 +210,7 @@ class Qwen3DFlashAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+
 class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
@@ -120,7 +230,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -144,6 +254,7 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         hidden_states = residual + hidden_states
         return hidden_states
 
+
 class DFlashDraftModel(Qwen3PreTrainedModel):
     config_class = Qwen3Config
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
@@ -154,7 +265,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3DFlashDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.target_layer_ids = self.config.dflash_config.get("target_layer_ids", build_target_layer_ids(config.num_target_layers, config.num_hidden_layers))
+        self.target_layer_ids = self.config.dflash_config.get(
+            "target_layer_ids", build_target_layer_ids(config.num_target_layers, config.num_hidden_layers)
+        )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.fc = nn.Linear(len(self.target_layer_ids) * config.hidden_size, config.hidden_size, bias=False)
@@ -188,7 +301,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
                 **kwargs,
             )
         return self.norm(hidden_states)
-    
+
     @torch.inference_mode()
     def spec_generate(
         self,
@@ -198,7 +311,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         stop_token_ids: list[int],
         temperature: float,
     ):
-        self.eval() 
+        self.eval()
         num_input_tokens = input_ids.shape[1]
         max_length = num_input_tokens + max_new_tokens
 
@@ -273,5 +386,5 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
             if stop_token_indices.numel() > 0:
                 output_ids = output_ids[:, : num_input_tokens + stop_token_indices[0] + 1]
-                
+
         return output_ids

@@ -1,5 +1,0 @@
-git+https://github.com/modal-labs/sglang.git@dflash_v2#subdirectory=python
-accelerate
-rich
-packaging
-ninja

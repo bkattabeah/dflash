@@ -5,7 +5,7 @@
 <br>
 
 <div align="center">
-  <img src="assets/dflash_system.png" alt="DFlash Architecture" width="100%">
+  <img src="https://github.com/user-attachments/assets/ffff3d17-96c9-421c-8d26-97127aafdba9" alt="DFlash Architecture" width="100%">
 </div>
 
 https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
@@ -17,6 +17,7 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 ### ✅ Supported
 - **Qwen3.5-4B**: https://huggingface.co/z-lab/Qwen3.5-4B-DFlash
 - **Qwen3.5-9B**: https://huggingface.co/z-lab/Qwen3.5-9B-DFlash
+- **Qwen3.5-27B**: https://huggingface.co/z-lab/Qwen3.5-27B-DFlash
 - **Qwen3.5-35B-A3B**: https://huggingface.co/z-lab/Qwen3.5-35B-A3B-DFlash
 - **Qwen3-Coder-Next**: https://huggingface.co/z-lab/Qwen3-Coder-Next-DFlash
 - **gpt-oss-20b**: https://huggingface.co/z-lab/gpt-oss-20b-DFlash
@@ -27,7 +28,6 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 - **Llama-3.1-8B-Instruct**: https://huggingface.co/z-lab/LLaMA3.1-8B-Instruct-DFlash-UltraChat
 
 ### 🚧 Coming Soon
-- **Qwen3.5-27B**
 - **Qwen3.5-122B-A10B**
 - **GLM-4.7-Flash**
 
@@ -38,42 +38,24 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 ## 🚀 Quick Start
 
-### Installation
+### Part 1: Base Installation (Transformers)
+
 ```bash
-conda create -n dflash python=3.11
+conda create -n dflash python=3.12
 conda activate dflash
 
 git clone https://github.com/z-lab/dflash.git
 cd dflash
 
-pip install uv
-uv pip install -r requirements.txt
+pip install -e .
 
-# Optionally install flash-attn.
-# If unavailable, evaluation falls back to torch.sdpa in the Transformers backend.
-# The measured speedup will be slower, but the acceptance length remains comparable.
-
-# uv pip install flash-attn --no-build-isolation
+# Optionally install flash-attn for faster attention.
+# If unavailable, falls back to torch.sdpa (slower speedup, same acceptance length).
+# pip install flash-attn --no-build-isolation
 ```
 
-### SGLang
+Only Qwen3 and LLaMA-3.1 models support the Transformers backend.
 
-```bash
-export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
-
-python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
-    --speculative-algorithm DFLASH \
-    --speculative-draft-model-path z-lab/Qwen3-Coder-30B-A3B-DFlash \
-    --tp-size 1 \
-    --dtype bfloat16 \
-    --attention-backend fa3 \
-    --mem-fraction-static 0.75 \
-    --trust-remote-code
-```
-
-### Transformers
-Only support Qwen3 series models and LLaMA-3.1-8B.
 ```python
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
@@ -95,7 +77,7 @@ prompt = "How many positive whole-number divisors does 196 have?"
 messages = [
     {"role": "user", "content": prompt}
 ]
-# Note: Qwen3 DFlash draft model is used for thinking mode disabled
+# Note: this draft model is used for thinking mode disabled
 text = tokenizer.apply_chat_template(
     messages,
     tokenize=False,
@@ -115,38 +97,115 @@ generate_ids = model.spec_generate(
 print(tokenizer.decode(generate_ids[0], skip_special_tokens=False))
 ```
 
-## 📊 Evaluation
-We provide scripts to reproduce the speedup and acceptance length metrics in the paper. The reported results were tested on NVIDIA H200 or B200 GPUs. Please note only Qwen3 series and LLaMA-3.1-8B models support Transformers backend benchmarks. For other models please use SGLang to run the benchmarks.
+### Part 2: SGLang (Optional)
 
-To run benchmark on Transformers backend:
+> **Note:** SGLang and vLLM may have conflicting dependencies. Use a separate conda environment for each.
+
 ```bash
-bash run_benchmark.sh
+conda create -n dflash-sglang python=3.12
+conda activate dflash-sglang
+
+git clone https://github.com/z-lab/dflash.git
+cd dflash
+
+pip install -e ".[sglang]"
 ```
 
-To run benchmark on SGLang:
+Launch the server (baseline):
+```bash
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --tp-size 1 --dtype bfloat16 --attention-backend fa3 \
+    --mem-fraction-static 0.75 --trust-remote-code
+```
+
+Or launch with DFlash speculative decoding:
 ```bash
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_DFLASH_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 
-python benchmark_sglang.py \
-  --target-model Qwen/Qwen3-8B \
-  --draft-model z-lab/Qwen3-8B-DFlash-b16 \
-  --concurrencies 1,4,8,16,32 \
-  --dataset-name math500 \
-  --attention-backends fa3,flashinfer \
-  --tp-size 1 \
-  --output-md sglang_results.md
+python -m sglang.launch_server \
+    --model-path Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --speculative-algorithm DFLASH \
+    --speculative-draft-model-path z-lab/Qwen3-Coder-30B-A3B-DFlash \
+    --tp-size 1 --dtype bfloat16 --attention-backend fa3 \
+    --mem-fraction-static 0.75 --trust-remote-code
 ```
 
-<div align="center">
-  <img src="assets/dflash_results.png" width="100%">
-</div>
+Then benchmark against the running server:
+```bash
+python benchmark.py --backend sglang \
+    --base-url http://127.0.0.1:30000 \
+    --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+    --dataset humaneval \
+    --num-prompts 164 \
+    --concurrency 32
+```
+
+### Part 3: vLLM (Optional)
+
+> **Note:** SGLang and vLLM may have conflicting dependencies. Use a separate conda environment for each.
+
+```bash
+conda create -n dflash-vllm python=3.12
+conda activate dflash-vllm
+
+git clone https://github.com/z-lab/dflash.git
+cd dflash
+
+pip install -e ".[vllm]"
+```
+
+Launch the server (baseline):
+```bash
+vllm serve Qwen/Qwen3.5-27B \
+  --attention-backend flash_attn \
+  --max-num-batched-tokens 32768
+```
+
+Or launch with DFlash speculative decoding:
+```bash
+vllm serve Qwen/Qwen3.5-27B \
+  --speculative-config '{"method": "dflash", "model": "z-lab/Qwen3.5-27B-DFlash", "num_speculative_tokens": 15}' \
+  --attention-backend flash_attn \
+  --max-num-batched-tokens 32768
+```
+
+Then benchmark against the running server:
+```bash
+python benchmark.py --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --model Qwen/Qwen3.5-27B \
+    --dataset humaneval \
+    --num-prompts 164 \
+    --concurrency 32
+```
+
+## 📊 Evaluation
+We provide scripts to reproduce the speedup and acceptance length metrics in the paper. The reported results were tested on NVIDIA H200 or B200 GPUs. **Please note that only Qwen3 series and LLaMA-3.1 models support Transformers backend benchmark. For other models please use SGLang to run the benchmarks.**
+
+All benchmarks share the same datasets (gsm8k, math500, humaneval, mbpp, mt-bench). Datasets are automatically downloaded and cached as JSONL in `cache/` on first run.
+
+```bash
+# Transformers (Part 1 install only)
+BACKEND=transformers bash run_benchmark.sh
+
+# SGLang (requires Part 2 install, server must be running)
+BACKEND=sglang MODEL=Qwen/Qwen3.5-9B BASE_URL=http://127.0.0.1:30000 bash run_benchmark.sh
+
+# vLLM (requires Part 3 install, server must be running)
+BACKEND=vllm MODEL=Qwen/Qwen3.5-27B BASE_URL=http://127.0.0.1:8000 bash run_benchmark.sh
+```
+
 
 ## **Acknowledgement**
 
-Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the other folks at [@modal-labs](https://github.com/modal-labs) for the fast, high-quality support in bringing DFlash into SGLang—making it possible to truly accelerate LLM serving in real-world deployments.
+Huge thanks to [@dcw02](https://github.com/dcw02), [@gongy](https://github.com/gongy), and the team at [@modal-labs](https://github.com/modal-labs) for their fast, high-quality support in bringing DFlash to SGLang. And huge thanks as well to [@benchislett](https://github.com/benchislett) at NVIDIA for his work in bringing DFlash to vLLM and helping make it available to the broader serving community.
 
 ## **Citation**
-If you find DFlash useful for your research or applications, please cite our project.
+If you find DFlash useful, please cite our work. To share feedback on DFlash or request new model support, please fill out this form: [DFlash Feedback](https://forms.gle/4YNwfqb4nJdqn6hq9).
 
 ```bibtex
 @article{chen2026dflash,
