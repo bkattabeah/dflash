@@ -38,11 +38,18 @@ Use a separate virtual environment for each to avoid conflict.
 | **Transformers** | `uv pip install -e .` |
 | **SGLang** | `uv pip install -e ".[sglang]"` |
 | **vLLM** | See below |
+| **MLX** (Apple Silicon) | See below |
 
 **vLLM:** DFlash support requires the nightly build:
 ```bash
 uv pip install -e ".[vllm]"
 uv pip install -U vllm --torch-backend=auto --extra-index-url https://wheels.vllm.ai/nightly
+```
+
+**MLX:** For Apple Silicon Macs (M-series):
+```bash
+pip install -e .
+pip install mlx mlx-lm
 ```
 
 ## 🚀 Quick Start
@@ -97,6 +104,22 @@ output = draft.spec_generate(input_ids=input_ids, max_new_tokens=2048, temperatu
 print(tokenizer.decode(output[0], skip_special_tokens=False))
 ```
 
+### MLX (Apple Silicon)
+
+Supports all models including Qwen3.5 (with hybrid recurrent layers).
+
+```python
+from dflash.utils_mlx import load, load_draft
+from dflash.generate_mlx import stream_generate
+
+model, tokenizer = load("Qwen/Qwen3.5-4B")
+draft = load_draft("z-lab/Qwen3.5-4B-DFlash")
+
+prompt = "How many positive whole-number divisors does 196 have?"
+for r in stream_generate(model, draft, tokenizer, prompt, block_size=16, max_tokens=2048):
+    print(r.text, end="", flush=True)
+```
+
 ## 📊 Evaluation
 
 All benchmarks share the same datasets (gsm8k, math500, humaneval, mbpp, mt-bench). Datasets are automatically downloaded and cached as JSONL in `cache/` on first run.
@@ -120,6 +143,13 @@ python -m dflash.benchmark --backend sglang \
 torchrun --nproc_per_node=8 -m dflash.benchmark --backend transformers \
     --model Qwen/Qwen3-8B --draft-model z-lab/Qwen3-8B-DFlash-b16 \
     --dataset gsm8k --max-samples 128
+```
+
+**MLX** (Apple Silicon):
+```bash
+python -m dflash.benchmark --backend mlx \
+    --model Qwen/Qwen3.5-4B --draft-model z-lab/Qwen3.5-4B-DFlash \
+    --dataset gsm8k --block-size 16 --max-samples 128
 ```
 
 ## Acknowledgement

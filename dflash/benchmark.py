@@ -309,6 +309,79 @@ def _send_vllm(
     return resp.json()
 
 
+def _run_mlx(args: argparse.Namespace) -> None:
+    from .utils_mlx import load, load_draft
+    from .generate_mlx import stream_generate
+    from mlx_lm import stream_generate as stream_generate_baseline
+    from mlx_lm.sample_utils import make_sampler
+
+    sampler = make_sampler(temp=args.temperature)
+
+    logger.info(f"Loading target: {args.model}")
+    model, tokenizer = load(args.model)
+    logger.info(f"Loading draft: {args.draft_model}")
+    draft = load_draft(args.draft_model)
+    block_size = args.block_size if args.block_size is not None else int(draft.config.block_size)
+
+    dataset = load_and_process_dataset(args.dataset)
+    if args.max_samples is not None and len(dataset) > args.max_samples:
+        random.shuffle(dataset)
+        dataset = dataset[:args.max_samples]
+
+    # Warmup
+    list(stream_generate_baseline(model, tokenizer, tokenizer.encode("Hi"), 3))
+
+    responses = []
+    for idx in tqdm(range(len(dataset))):
+        instance = dataset[idx]
+        messages = []
+        for user_content in instance["turns"]:
+            messages.append({"role": "user", "content": user_content})
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+            )
+
+            response = {}
+
+            # Baseline (block_size=1)
+            tokens_bl, tps_bl = [], 0
+            for r in stream_generate_baseline(model, tokenizer, prompt, args.max_new_tokens, sampler=sampler):
+                tokens_bl.append(r.token)
+                tps_bl = r.generation_tps
+            response[1] = SimpleNamespace(
+                num_output_tokens=len(tokens_bl),
+                time_per_output_token=1.0 / tps_bl if tps_bl > 0 else float("inf"),
+                acceptance_lengths=[1],
+            )
+
+            # DFlash
+            tokens_df, accs, tps_df = [], [], 0
+            for r in stream_generate(model, draft, tokenizer, prompt, block_size, args.max_new_tokens, sampler):
+                tokens_df.extend(r.tokens)
+                accs.append(r.accepted)
+                tps_df = r.generation_tps
+            response[block_size] = SimpleNamespace(
+                num_output_tokens=len(tokens_df),
+                time_per_output_token=1.0 / tps_df if tps_df > 0 else float("inf"),
+                acceptance_lengths=accs,
+            )
+
+            output_text = tokenizer.decode(tokens_df)
+            messages.append({"role": "assistant", "content": output_text})
+            responses.append(response)
+
+    t1 = np.mean([r[1].time_per_output_token for r in responses])
+    tb = np.mean([r[block_size].time_per_output_token for r in responses])
+    print(f"Decoding speedup: {t1 / tb:.2f}")
+
+    tau = np.mean([np.mean(r[block_size].acceptance_lengths) for r in responses])
+    print(f"Average Acceptance length: {tau:.2f}")
+
+    acceptance_lengths = list(chain(*[r[block_size].acceptance_lengths for r in responses]))
+    histogram = [acceptance_lengths.count(b) / len(acceptance_lengths) for b in range(block_size + 1)]
+    print(f"Acceptance length histogram: {[f'{x * 100:.1f}%' for x in histogram]}")
+
+
 def _run_server(args: argparse.Namespace) -> None:
     is_vllm = args.backend == "vllm"
     dataset = load_and_process_dataset(args.dataset)
@@ -401,7 +474,7 @@ def _run_server(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="DFlash benchmark")
-    parser.add_argument("--backend", choices=["transformers", "sglang", "vllm"], required=True)
+    parser.add_argument("--backend", choices=["transformers", "sglang", "vllm", "mlx"], required=True)
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -425,6 +498,10 @@ def main() -> None:
         if args.draft_model is None:
             parser.error("--draft-model is required for transformers backend")
         _run_transformers(args)
+    elif args.backend == "mlx":
+        if args.draft_model is None:
+            parser.error("--draft-model is required for mlx backend")
+        _run_mlx(args)
     else:
         _run_server(args)
 
