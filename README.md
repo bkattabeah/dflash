@@ -35,15 +35,15 @@ Use a separate virtual environment for each to avoid conflict.
 
 | Backend | Install command |
 |---|---|
-| **Transformers** | `pip install -e ".[transformers]"` |
-| **SGLang** | `pip install -e ".[sglang]"` |
+| **Transformers** | `uv pip install -e ".[transformers]"` |
+| **SGLang** | `uv pip install -e ".[sglang]"` |
 | **vLLM** | See below |
 | **MLX** (Apple Silicon) | `pip install -e ".[mlx]"` |
 
 **vLLM:** DFlash support requires the nightly build:
 ```bash
-pip install -e ".[vllm]"
-pip install -U vllm --torch-backend=auto --extra-index-url https://wheels.vllm.ai/nightly
+uv pip install -e ".[vllm]"
+uv pip install -U vllm --torch-backend=auto --extra-index-url https://wheels.vllm.ai/nightly
 ```
 
 ## 🚀 Quick Start
