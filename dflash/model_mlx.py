@@ -2,6 +2,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
@@ -18,6 +19,9 @@ try:
     _HAS_GDN = True
 except ImportError:
     _HAS_GDN = False
+
+
+_GDN_PATCH_LOCK = RLock()
 
 
 @dataclass
@@ -185,10 +189,21 @@ class _GDNStateCapture:
     def __init__(self):
         self.conv_data = []
         self._gdn_inputs = []
-        self._patch()
+        self._gdn_cls = None
+        self._orig_call = None
+        self._patched_call = None
+        self._closed = False
+        _GDN_PATCH_LOCK.acquire()
+        try:
+            self._patch()
+        except Exception:
+            _GDN_PATCH_LOCK.release()
+            raise
 
     def _patch(self):
         from mlx_lm.models.qwen3_5 import GatedDeltaNet
+        self._gdn_cls = GatedDeltaNet
+        self._orig_call = GatedDeltaNet.__call__
         capture = self
 
         def _capturing_gdn_call(self_layer, inputs, mask=None, cache=None):
@@ -231,11 +246,25 @@ class _GDNStateCapture:
                 out = mx.distributed.all_sum(out, group=self_layer.sharding_group)
             return out
 
+        self._patched_call = _capturing_gdn_call
         GatedDeltaNet.__call__ = _capturing_gdn_call
 
     def clear(self):
         self.conv_data.clear()
         self._gdn_inputs.clear()
+
+    def close(self):
+        if self._closed:
+            return
+        try:
+            if self._gdn_cls is not None and self._gdn_cls.__call__ is self._patched_call:
+                self._gdn_cls.__call__ = self._orig_call
+        finally:
+            self._closed = True
+            self._gdn_cls = None
+            self._orig_call = None
+            self._patched_call = None
+            _GDN_PATCH_LOCK.release()
 
     def rollback(self, cache, accepted, trim):
         j = 0
@@ -302,84 +331,93 @@ def stream_generate(
     draft_cache = make_prompt_cache(draft)
     draft.bind(model)
     _target_can_trim = can_trim_prompt_cache(target_cache)
-    _capture = _GDNStateCapture() if (not _target_can_trim and _HAS_GDN) else None
+    if not _target_can_trim and not _HAS_GDN:
+        raise RuntimeError(
+            "This MLX model requires gated-delta rollback support, but "
+            "mlx_lm.models.gated_delta is unavailable."
+        )
+    _capture = _GDNStateCapture() if not _target_can_trim else None
 
-    tic = time.perf_counter()
-    with mx.stream(generation_stream):
-        logits = model(prompt[None], target_cache)
-        hidden = mx.concatenate(model._hidden_states, axis=-1)
-    mx.eval(logits, hidden)
-    prompt_tps = prompt.size / (time.perf_counter() - tic)
-
-    tic = time.perf_counter()
-    token = sampler(logits[:, -1:])[0, 0].item()
-    tokens.append(token)
-    n = 1
-
-    if token in tokenizer.eos_token_ids:
-        detokenizer.add_token(token)
-        detokenizer.finalize()
-        yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic, "stop")
-        return
-
-    detokenizer.add_token(token)
-    yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic)
-
-    while n < max_tokens:
-        bs = min(block_size, max_tokens - n + 1)
-        if bs <= 1:
-            break
-
+    try:
+        tic = time.perf_counter()
         with mx.stream(generation_stream):
-            block = mx.array([[tokens[-1]] + [mask_id] * (bs - 1)])
-            draft_logits = draft(block, hidden, draft_cache)
-            if (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0:
-                trim_prompt_cache(draft_cache, trim_n)
-            draft_tokens = sampler(draft_logits[:, 1 - bs:])
-        mx.async_eval(draft_tokens)
-
-        if _capture is not None:
-            _capture.clear()
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate([mx.array([[tokens[-1]]]), draft_tokens], axis=1)
-            logits = model(verify_input, target_cache)
+            logits = model(prompt[None], target_cache)
             hidden = mx.concatenate(model._hidden_states, axis=-1)
-            target_tokens = sampler(logits)
-        mx.async_eval(target_tokens, hidden)
+        mx.eval(logits, hidden)
+        prompt_tps = prompt.size / (time.perf_counter() - tic)
 
-        d_list, t_list = draft_tokens[0].tolist(), target_tokens[0].tolist()
-        accepted = next((i for i in range(len(d_list)) if d_list[i] != t_list[i]), len(d_list))
-        new_tokens = d_list[:accepted] + [t_list[accepted]]
-        new_tokens = new_tokens[:max_tokens - n]
+        tic = time.perf_counter()
+        token = sampler(logits[:, -1:])[0, 0].item()
+        tokens.append(token)
+        n = 1
 
-        eos_idx = next((i for i, t in enumerate(new_tokens) if t in tokenizer.eos_token_ids), None)
-        if eos_idx is not None:
-            new_tokens = new_tokens[:eos_idx + 1]
-            for t in new_tokens:
-                detokenizer.add_token(t)
+        if token in tokenizer.eos_token_ids:
+            detokenizer.add_token(token)
             detokenizer.finalize()
-            tokens.extend(new_tokens)
-            n += len(new_tokens)
-            yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic, "stop")
+            yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic, "stop")
             return
 
-        for t in new_tokens:
-            detokenizer.add_token(t)
-        tokens.extend(new_tokens)
-        n += len(new_tokens)
+        detokenizer.add_token(token)
+        yield _make_response(detokenizer.last_segment, [token], 1, prompt.size, prompt_tps, n, tic)
 
-        if n % 256 == 0:
-            mx.clear_cache()
+        while n < max_tokens:
+            bs = min(block_size, max_tokens - n + 1)
+            if bs <= 1:
+                break
 
-        yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic)
+            with mx.stream(generation_stream):
+                block = mx.array([[tokens[-1]] + [mask_id] * (bs - 1)])
+                draft_logits = draft(block, hidden, draft_cache)
+                if (trim_n := draft_cache[0].offset - (prompt.size + n - 1)) > 0:
+                    trim_prompt_cache(draft_cache, trim_n)
+                draft_tokens = sampler(draft_logits[:, 1 - bs:])
+            mx.async_eval(draft_tokens)
 
-        trim = bs - accepted - 1
-        if trim > 0:
-            if _target_can_trim:
-                trim_prompt_cache(target_cache, trim)
-            elif _capture is not None:
-                _capture.rollback(target_cache, accepted, trim)
-        hidden = hidden[:, :accepted + 1, :]
+            if _capture is not None:
+                _capture.clear()
+            with mx.stream(generation_stream):
+                verify_input = mx.concatenate([mx.array([[tokens[-1]]]), draft_tokens], axis=1)
+                logits = model(verify_input, target_cache)
+                hidden = mx.concatenate(model._hidden_states, axis=-1)
+                target_tokens = sampler(logits)
+            mx.async_eval(target_tokens, hidden)
 
-    detokenizer.finalize()
-    yield _make_response(detokenizer.last_segment, [], 0, prompt.size, prompt_tps, n, tic, "length")
+            d_list, t_list = draft_tokens[0].tolist(), target_tokens[0].tolist()
+            accepted = next((i for i in range(len(d_list)) if d_list[i] != t_list[i]), len(d_list))
+            new_tokens = d_list[:accepted] + [t_list[accepted]]
+            new_tokens = new_tokens[:max_tokens - n]
+
+            eos_idx = next((i for i, t in enumerate(new_tokens) if t in tokenizer.eos_token_ids), None)
+            if eos_idx is not None:
+                new_tokens = new_tokens[:eos_idx + 1]
+                for t in new_tokens:
+                    detokenizer.add_token(t)
+                detokenizer.finalize()
+                tokens.extend(new_tokens)
+                n += len(new_tokens)
+                yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic, "stop")
+                return
+
+            for t in new_tokens:
+                detokenizer.add_token(t)
+            tokens.extend(new_tokens)
+            n += len(new_tokens)
+
+            if n % 256 == 0:
+                mx.clear_cache()
+
+            yield _make_response(detokenizer.last_segment, new_tokens, accepted + 1, prompt.size, prompt_tps, n, tic)
+
+            trim = bs - accepted - 1
+            if trim > 0:
+                if _target_can_trim:
+                    trim_prompt_cache(target_cache, trim)
+                elif _capture is not None:
+                    _capture.rollback(target_cache, accepted, trim)
+            hidden = hidden[:, :accepted + 1, :]
+
+        detokenizer.finalize()
+        yield _make_response(detokenizer.last_segment, [], 0, prompt.size, prompt_tps, n, tic, "length")
+    finally:
+        if _capture is not None:
+            _capture.close()

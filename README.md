@@ -31,7 +31,7 @@ https://github.com/user-attachments/assets/5b29cabb-eb95-44c9-8ffe-367c0758de8c
 
 ## 📦 Installation
 
-Use a separate virtual environment for each backend. The Transformers backend is pinned to `transformers==4.57.1`, while `mlx-lm` currently tracks the Transformers 5.x line, so `.[transformers]` and `.[mlx]` should not be installed together.
+Use a separate virtual environment for each to avoid conflict.
 
 | Backend | Install command |
 |---|---|
