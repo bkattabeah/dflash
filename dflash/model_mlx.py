@@ -336,6 +336,12 @@ class _GDNStateCapture:
             _GDN_PATCH_LOCK.release()
 
     def rollback(self, cache, accepted, trim):
+        n_non_trimmable = sum(1 for c in cache if not c.is_trimmable())
+        assert n_non_trimmable == len(self._gdn_inputs), (
+            f"non-trimmable cache count ({n_non_trimmable}) != "
+            f"captured GDN inputs ({len(self._gdn_inputs)}); "
+            "DFlash MLX rollback assumes every non-trimmable cache is a GatedDeltaNet layer"
+        )
         j = 0
         for c in cache:
             if c.is_trimmable():
