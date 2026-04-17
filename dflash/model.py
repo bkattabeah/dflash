@@ -147,8 +147,7 @@ def dflash_generate(
         ):
             break
 
-    output_ids = output_ids[:, :max_length]
-    output_ids = output_ids[:, output_ids[0] != mask_token_id]
+    output_ids = output_ids[:, :min(start + 1, max_length)]
     if stop_token_ids is not None:
         stop_token_ids = torch.tensor(stop_token_ids, device=output_ids.device)
         stop_token_indices = torch.isin(output_ids[0][num_input_tokens:], stop_token_ids).nonzero(as_tuple=True)[0]
