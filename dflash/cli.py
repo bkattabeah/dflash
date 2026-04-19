@@ -17,7 +17,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     gen.add_argument("--model", type=str, required=True, help="HuggingFace model id or local path")
     gen.add_argument("--prompt", type=str, default="Once upon a time", help="Input prompt")
     gen.add_argument("--max-new-tokens", type=int, default=200, help="Maximum tokens to generate")
-    gen.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    gen.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature")  # lowered from 1.0 for less random outputs
     gen.add_argument("--top-p", type=float, default=0.9, help="Top-p (nucleus) sampling")
     gen.add_argument("--device", type=str, default=None, help="Device override (cuda/cpu/mps)")
     gen.add_argument("--dtype", type=str, default=None, help="Dtype override (float16/bfloat16/float32)")
@@ -61,60 +61,4 @@ def cmd_generate(args: argparse.Namespace) -> None:
     inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
 
     with timer("generation"), torch.no_grad():
-        output_ids = dflash_generate(
-            model,
-            inputs["input_ids"],
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-        )
-
-    generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-    print("\n" + "=" * 60)
-    print(generated)
-    print("=" * 60)
-
-
-def cmd_benchmark(args: argparse.Namespace) -> None:
-    import json
-    from dflash.benchmark import load_and_process_dataset, _limit_dataset
-    from dflash.utils import get_device, get_dtype
-
-    device = get_device(args.device)
-    dtype = get_dtype(args.dtype)
-
-    print(f"Benchmarking '{args.model}' on {device} ({dtype}) ...")
-
-    dataset = load_and_process_dataset(
-        args.model,
-        dataset_name=args.dataset,
-        dataset_config=args.dataset_config,
-        split=args.split,
-    )
-    dataset = _limit_dataset(dataset, args.limit)
-
-    print(f"Dataset ready: {len(dataset)} samples")
-    # Detailed benchmark loop lives in benchmark.py; here we just confirm setup.
-    results = {"model": args.model, "samples": len(dataset), "device": str(device)}
-
-    if args.output:
-        with open(args.output, "w") as f:
-            json.dump(results, f, indent=2)
-        print(f"Results saved to {args.output}")
-    else:
-        print(results)
-
-
-def main(argv: Optional[list] = None) -> None:
-    args = parse_args(argv)
-    if args.command == "generate":
-        cmd_generate(args)
-    elif args.command == "benchmark":
-        cmd_benchmark(args)
-    else:
-        print(f"Unknown command: {args.command}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        o
